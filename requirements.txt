@@ -1,0 +1,15 @@
+streamlit
+langchain
+langchain-community
+langchain-core
+langchain-huggingface
+langchain-groq
+sentence-transformers
+faiss-cpu
+rank-bm25
+pymupdf
+python-dotenv
+pandas
+openpyxl
+tqdm
+langsmith
