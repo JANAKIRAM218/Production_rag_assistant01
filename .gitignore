@@ -1,0 +1,15 @@
+@"
+.venv/
+__pycache__/
+*.pyc
+
+.env
+
+.streamlit/
+
+scratch/
+
+*.log
+
+evaluation/results.csv
+"@ | Out-File -Encoding utf8 .gitignore
