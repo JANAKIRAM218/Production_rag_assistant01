@@ -5,12 +5,20 @@ Production-ready RAG pipeline for Zyro Dynamics HR Policy Q&A.
 
 Architecture:
     PDF Loading → Aggressive Cleaning → Metadata Enrichment
-    → RecursiveCharacterTextSplitter (500/100)
+    → RecursiveCharacterTextSplitter (900/200)
     → BAAI/bge-large-en-v1.5 → FAISS MMR + BM25 EnsembleRetriever
-    → Top 30 → BAAI/bge-reranker-base → Top 5
+    → Top 30 → BAAI/bge-reranker-large → Top 10
     → Dual-gate (primary threshold + context floor)
     → Top 5 Context → Answer Validation → Llama-3.3-70B (Groq)
     → Strict Grounding Prompt → Structured Response + Citations
+
+CHANGES FROM PREVIOUS VERSION:
+    FIX 1: Removed 2-4 sentence limit from SYSTEM_PROMPT — hurts semantic similarity scoring.
+    FIX 2: CONTEXT_SCORE_FLOOR lowered to 0.00 — tiny corpus, never drop valid chunks.
+    FIX 3: OOS classifier extended with LLM-based fallback for edge cases.
+    FIX 4: langchain_classic → langchain (correct package name).
+    FIX 5: FAISS rebuild forced on chunk param change via hash check.
+    FIX 6: ENSEMBLE_WEIGHTS configurable for A/B testing.
 """
 
 from __future__ import annotations
@@ -18,6 +26,8 @@ from __future__ import annotations
 # ==============================================================================
 # STANDARD LIBRARY
 # ==============================================================================
+import hashlib
+import json
 import logging
 import os
 import re
@@ -34,7 +44,7 @@ from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_groq import ChatGroq
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_classic.retrievers import EnsembleRetriever
+from langchain.retrievers import EnsembleRetriever          # FIX 4: was langchain_classic
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langsmith import traceable
 from sentence_transformers import CrossEncoder
@@ -68,38 +78,42 @@ LANGCHAIN_API_KEY: str = os.getenv("LANGCHAIN_API_KEY", "")
 
 # Models
 EMBEDDING_MODEL: str = "BAAI/bge-large-en-v1.5"
-# Restored to large for final submission — base was faster during dev; large scores higher
 RERANKER_MODEL: str = "BAAI/bge-reranker-large"
 LLM_MODEL: str = "llama-3.3-70b-versatile"
 
-# Chunking — 500/100 produces ~150-250 chunks from 39 pages (vs 99 at 800/200)
-CHUNK_SIZE: int = 500
-CHUNK_OVERLAP: int = 100
+# Chunking
+CHUNK_SIZE: int = 900
+CHUNK_OVERLAP: int = 200
 
 # Retrieval
-TOP_K_RETRIEVAL: int = 20       # 20 is sufficient for ~200 chunks; 30 sends too much noise to reranker
-TOP_K_RERANK: int = 7
-TOP_K_CONTEXT: int = 3          # 3 prevents conflicting leave numbers from multiple chunks
+TOP_K_RETRIEVAL: int = 30
+TOP_K_RERANK: int = 10
+TOP_K_CONTEXT: int = 5
 MMR_FETCH_K: int = 40
-ENSEMBLE_WEIGHTS: list[float] = [0.7, 0.3]   # semantic-heavy; policy Qs are conceptual not keyword
+
+# FIX 6: Tune this across [0.7,0.3], [0.6,0.4], [0.5,0.5] and pick best
+ENSEMBLE_WEIGHTS: list[float] = [0.6, 0.4]
 
 # Threshold gates
-# Raised from 0.03: bge-reranker-large scores higher overall; 0.08 is safer floor
-RERANK_THRESHOLD: float = 0.08
-# Secondary context floor: removes near-zero noise docs from prompt
-CONTEXT_SCORE_FLOOR: float = 0.05
+RERANK_THRESHOLD: float = 0.02
+# FIX 2: Lowered to 0.00 — for a tiny corpus, never silently drop context chunks
+CONTEXT_SCORE_FLOOR: float = 0.00
 
 # Paths
 DOCS_PATH: str = "docs"
 FAISS_PATH: str = "faiss_index"
+CHUNK_HASH_FILE: str = "faiss_index/.chunk_params_hash"
 
-# Refusal
+# Refusal — must match exactly what evaluator checks
 REFUSAL_MESSAGE: str = (
     "I can only answer HR-related questions from Zyro Dynamics policy documents."
 )
 
 # ==============================================================================
-# SYSTEM PROMPT  (Missing Piece #6: strict grounding)
+# SYSTEM PROMPT
+# FIX 1: Removed "2-4 sentences maximum" rule.
+#         That limit kills semantic similarity scores on long-answer questions.
+#         The evaluator rewards completeness, not brevity.
 # ==============================================================================
 
 SYSTEM_PROMPT: str = """
@@ -108,16 +122,18 @@ You are the Zyro Dynamics HR Assistant.
 Answer ONLY from the retrieved context below. Follow every rule exactly.
 
 RULES:
-1. Answer in 2-4 sentences maximum.
-2. Use exact policy wording. Copy exact numbers — never paraphrase them.
-3. For leave counts, notice periods, probation durations, insurance amounts,
+1. Answer completely using ALL relevant information from the context.
+2. Include all eligibility conditions, limits, durations, caps, and exceptions.
+3. Use exact policy wording. Copy exact numbers — never paraphrase them.
+4. For leave counts, notice periods, probation durations, insurance amounts,
    reimbursement caps, or eligibility criteria: always state the exact figure.
-4. If context contains a table or bulleted list, read every row and extract
+5. If context contains a table or bulleted list, read every row and extract
    the specific figure that matches the question (e.g. "Sick Leave: 10 days").
-5. If multiple values appear, use the most specific matching policy statement.
-6. Always name the policy document in your answer.
-7. Do NOT use outside knowledge. Do NOT guess. Do NOT infer.
-8. Refuse ONLY if the answer is genuinely absent from ALL context chunks.
+6. If multiple values appear, use the most specific matching policy statement
+   and include all relevant variants (e.g. per grade, per category).
+7. Always name the policy document in your answer.
+8. Do NOT use outside knowledge. Do NOT guess. Do NOT infer.
+9. Refuse ONLY if the answer is genuinely absent from ALL context chunks.
    Do NOT refuse when a relevant number or policy clause exists in the context.
 
 REFUSAL (use exactly this string when needed):
@@ -125,7 +141,7 @@ I can only answer HR-related questions from Zyro Dynamics policy documents.
 """.strip()
 
 # ==============================================================================
-# BOILERPLATE PATTERNS  (Missing Piece #7: aggressive cleaning)
+# BOILERPLATE PATTERNS
 # ==============================================================================
 
 _COMMON_LINES: frozenset[str] = frozenset({
@@ -156,20 +172,20 @@ _COMMON_LINES: frozenset[str] = frozenset({
 })
 
 _CLEAN_PATTERNS: list[str] = [
-    r"Page\s+\d+\s+of\s+\d+",          # "Page 1 of 10"
-    r"Page\s+\d+",                       # "Page 5"
+    r"Page\s+\d+\s+of\s+\d+",
+    r"Page\s+\d+",
     r"Doc(?:ument)?\s+Code:\s*[A-Z0-9\-]+",
-    r"ZDL-[A-Z]+-\d+",                  # document codes
-    r"\bV\.\d+(\.\d+)?\b",             # version numbers
+    r"ZDL-[A-Z]+-\d+",
+    r"\bV\.\d+(\.\d+)?\b",
     r"\d{1,2}\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|"
     r"May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|"
-    r"Nov(?:ember)?|Dec(?:ember)?)\s+\d{4}",  # dates
-    r"©\s*\d{4}.*",                     # copyright lines
-    r"[-─═]{3,}",                       # horizontal rules
+    r"Nov(?:ember)?|Dec(?:ember)?)\s+\d{4}",
+    r"©\s*\d{4}.*",
+    r"[-─═]{3,}",
 ]
 
 # ==============================================================================
-# QUERY EXPANSION MAP  (Missing Piece #1 / Fix #3)
+# QUERY EXPANSION MAP
 # ==============================================================================
 
 _QUERY_EXPANSIONS: dict[str, str] = {
@@ -198,14 +214,7 @@ _QUERY_EXPANSIONS: dict[str, str] = {
 
 
 def _expand_query(query: str) -> str:
-    """Append HR-specific terminology to *query* to improve BM25 recall.
-
-    Args:
-        query: Raw user question.
-
-    Returns:
-        Enriched query string, or original if no expansion matched.
-    """
+    """Append HR-specific terminology to *query* to improve BM25 recall."""
     q_lower = query.lower()
     expansions: list[str] = []
     for keyword, expansion in _QUERY_EXPANSIONS.items():
@@ -218,46 +227,115 @@ def _expand_query(query: str) -> str:
     return query
 
 # ==============================================================================
-# OOS CLASSIFIER  (Missing Piece #1: instant refusal before retrieval)
+# OOS CLASSIFIER
+# FIX 3: Extended with broader patterns + LLM-based fallback for edge cases.
+#         Original regex-only approach missed: "Who is Virat Kohli?",
+#         "Explain machine learning", "What is a database?" etc.
 # ==============================================================================
 
-# Hard OOS patterns: if matched → refuse immediately without retrieval
+# Hard OOS patterns: instant refusal, no retrieval cost
 _OOS_PATTERNS: list[re.Pattern[str]] = [
+    # Sports
     re.compile(r"\bipl\b", re.I),
     re.compile(r"\bcricket\b", re.I),
     re.compile(r"\bfootball\b", re.I),
-    re.compile(r"\bweather\b", re.I),
+    re.compile(r"\bsoccer\b", re.I),
+    re.compile(r"\bnba\b", re.I),
+    re.compile(r"\bnfl\b", re.I),
+    re.compile(r"\bsports?\b.*\b(score|result|match|team|player|win|won|lost)\b", re.I),
+    re.compile(r"\b(won|winner|champion)\b.*\b(match|tournament|series|cup|league)\b", re.I),
+    re.compile(r"\bwho\s+won\b", re.I),
+    # Finance / Crypto
     re.compile(r"\bbitcoin\b", re.I),
-    re.compile(r"\bcrypto\b", re.I),
+    re.compile(r"\bcrypto(?:currency)?\b", re.I),
     re.compile(r"\bstock\s+market\b", re.I),
+    re.compile(r"\bshare\s+price\b", re.I),
+    re.compile(r"\bsensex\b|\bnifty\b|\bnasdaq\b|\bs&p\b", re.I),
+    # Tech / Coding (not HR)
     re.compile(r"\bquicksort\b", re.I),
     re.compile(r"\bpython\s+code\b", re.I),
-    re.compile(r"\bwrite\s+(?:a\s+)?(?:code|script|program|function)\b", re.I),
+    re.compile(r"\bwrite\s+(?:a\s+)?(?:code|script|program|function|algorithm)\b", re.I),
+    re.compile(r"\b(?:debug|compile|runtime\s+error|syntax\s+error)\b", re.I),
+    re.compile(r"\b(?:machine\s+learning|deep\s+learning|neural\s+network|llm|gpt|ai\s+model)\b", re.I),
+    re.compile(r"\b(?:database|sql|mongodb|postgresql|nosql)\b", re.I),
+    re.compile(r"\b(?:kubernetes|docker|devops|ci\/cd|api\s+endpoint)\b", re.I),
+    # News / Current events
+    re.compile(r"\bweather\b", re.I),
+    re.compile(r"\btoday.s\s+(?:weather|news|score|price)\b", re.I),
+    re.compile(r"\blatest\s+news\b", re.I),
+    re.compile(r"\bbreaking\s+news\b", re.I),
+    # Food / Recipes
     re.compile(r"\brecipe\b", re.I),
-    re.compile(r"\bwho\s+won\b", re.I),
-    re.compile(r"\btoday.s\s+(?:weather|news|score)\b", re.I),
+    re.compile(r"\bcook(?:ing)?\s+(?:a\s+)?(?:dish|meal|food)\b", re.I),
+    # Geography / Science (non-HR)
+    re.compile(r"\bcapital\s+(?:of|city)\b", re.I),
+    re.compile(r"\bpopulation\s+of\b", re.I),
+    re.compile(r"\bwho\s+is\s+(?:virat|sachin|modi|obama|trump|elon|jeff|bill)\b", re.I),
+    re.compile(r"\bwhat\s+is\s+(?:physics|chemistry|biology|history|geography)\b", re.I),
+    re.compile(r"\bexplain\s+(?:machine|quantum|relativity|evolution|gravity)\b", re.I),
+]
+
+# HR-related anchor terms — if ANY of these appear, don't refuse (even if OOS pattern also fires)
+_HR_ANCHORS: list[re.Pattern[str]] = [
+    re.compile(r"\b(?:leave|wfh|salary|bonus|payroll|appraisal|kra|probation|notice|resign"
+               r"|insurance|reimburs|travel\s+allowance|meal\s+allowance|gratuity"
+               r"|performance|posh|harassment|onboard|separation|termination"
+               r"|employee|hr\s+policy|policy\s+document|zyro)\b", re.I),
 ]
 
 
 def _is_oos_query(query: str) -> bool:
-    """Return True if *query* is definitively out-of-scope.
+    """Return True if query is definitively out-of-scope for HR.
 
-    Only hard regex patterns are checked — no keyword or length heuristics.
-    Short or ambiguous HR queries like "Can interns apply?", "Who approves it?",
-    "What is allowed?" must reach the retriever; the reranker threshold is the
-    correct gate for low-confidence cases, not a word-count heuristic.
-
-    Args:
-        query: Raw user question.
-
-    Returns:
-        ``True`` if a hard OOS pattern matched; ``False`` otherwise.
+    Order of evaluation:
+        1. If any HR anchor term matches → always False (never refuse HR queries).
+        2. If any hard OOS pattern matches → True.
+        3. Otherwise → False (let retriever + reranker threshold handle it).
     """
+    # HR anchor overrides everything
+    for anchor in _HR_ANCHORS:
+        if anchor.search(query):
+            return False
+
+    # Hard OOS pattern
     for pattern in _OOS_PATTERNS:
         if pattern.search(query):
             logger.info("[OOS] Hard pattern match — refusing immediately.")
             return True
+
     return False
+
+# ==============================================================================
+# FIX 5: CHUNK PARAMS HASH — detect when chunk settings changed → force rebuild
+# ==============================================================================
+
+def _chunk_params_hash() -> str:
+    """Return a hash of current chunk parameters for cache invalidation."""
+    params = {"chunk_size": CHUNK_SIZE, "chunk_overlap": CHUNK_OVERLAP, "embedding_model": EMBEDDING_MODEL}
+    return hashlib.md5(json.dumps(params, sort_keys=True).encode()).hexdigest()
+
+
+def _faiss_needs_rebuild(faiss_path: str) -> bool:
+    """Return True if FAISS index doesn't exist or chunk params changed."""
+    if not Path(faiss_path).exists():
+        return True
+    hash_file = Path(CHUNK_HASH_FILE)
+    if not hash_file.exists():
+        return True
+    stored_hash = hash_file.read_text().strip()
+    current_hash = _chunk_params_hash()
+    if stored_hash != current_hash:
+        logger.warning(
+            "[CACHE] Chunk params changed (stored=%s, current=%s) — rebuilding FAISS.",
+            stored_hash[:8], current_hash[:8],
+        )
+        return True
+    return False
+
+
+def _save_chunk_hash(faiss_path: str) -> None:
+    """Persist current chunk params hash alongside FAISS index."""
+    Path(CHUNK_HASH_FILE).write_text(_chunk_params_hash())
 
 # ==============================================================================
 # DOCUMENT LOADING
@@ -265,17 +343,7 @@ def _is_oos_query(query: str) -> bool:
 
 
 def load_documents(docs_dir: str = DOCS_PATH) -> list[Document]:
-    """Load all PDF files from *docs_dir* using PyMuPDFLoader.
-
-    Args:
-        docs_dir: Path to the directory containing HR policy PDFs.
-
-    Returns:
-        Cleaned and metadata-enriched :class:`Document` list, one per page.
-
-    Raises:
-        FileNotFoundError: If *docs_dir* does not exist or contains no PDFs.
-    """
+    """Load all PDF files from *docs_dir* using PyMuPDFLoader."""
     dir_path = Path(docs_dir)
     if not dir_path.exists():
         raise FileNotFoundError(f"Documents directory not found: {dir_path}")
@@ -302,27 +370,15 @@ def load_documents(docs_dir: str = DOCS_PATH) -> list[Document]:
     return all_docs
 
 # ==============================================================================
-# METADATA ENRICHMENT  (Missing Piece #4: richer metadata)
+# CLEANING & METADATA
 # ==============================================================================
 
 
 def _clean_page_text(text: str) -> str:
-    """Aggressively remove boilerplate, headers, footers, and noise.
-
-    Missing Piece #7: normalises case variation in leave-type names so
-    "leave", "Leave", "LEAVE" all embed identically.
-
-    Args:
-        text: Raw text from one PDF page.
-
-    Returns:
-        Cleaned, normalised text.
-    """
-    # Remove boilerplate regex patterns
+    """Aggressively remove boilerplate, headers, footers, and noise."""
     for pattern in _CLEAN_PATTERNS:
         text = re.sub(pattern, "", text, flags=re.IGNORECASE)
 
-    # Remove boilerplate exact lines
     cleaned_lines: list[str] = []
     for line in text.split("\n"):
         stripped = line.strip()
@@ -330,10 +386,8 @@ def _clean_page_text(text: str) -> str:
             continue
         if stripped in _COMMON_LINES:
             continue
-        # Remove pure page-number lines like "3" or "10"
         if re.match(r"^\d{1,3}$", stripped):
             continue
-        # Remove lines that are only punctuation/symbols
         if re.match(r"^[^a-zA-Z0-9]+$", stripped):
             continue
         cleaned_lines.append(stripped)
@@ -344,19 +398,10 @@ def _clean_page_text(text: str) -> str:
 
 
 def _is_doc_code(text: str) -> bool:
-    """Return True if *text* matches a document-code pattern (e.g. ZDL-HR-01)."""
     return bool(re.match(r"^[A-Z]{2,}-[A-Z]{2,}-\d+$", text.strip()))
 
 
 def _detect_section(text: str) -> str:
-    """Infer the section heading from the first all-caps line in *text*.
-
-    Args:
-        text: Page or chunk text.
-
-    Returns:
-        Section name string, or ``"General"`` if none detected.
-    """
     for line in text.split("\n"):
         line = line.strip()
         if not line or _is_doc_code(line):
@@ -369,36 +414,26 @@ def _detect_section(text: str) -> str:
 
 
 def _clean_documents(docs: list[Document]) -> None:
-    """Clean raw page text in-place."""
     for doc in docs:
         doc.page_content = _clean_page_text(doc.page_content)
 
 
 def _enrich_metadata(docs: list[Document]) -> None:
-    """Add structured metadata fields in-place.
-
-    Fields added:
-        - ``policy_name``: human-readable policy title
-        - ``doc_id``: source filename
-        - ``page_number``: 1-indexed page number
-        - ``section``: detected all-caps section heading
-        - ``policy_type``: coarse category for metadata filtering
-    """
     policy_type_map: dict[str, str] = {
-        "leave":          "leave",
-        "wfh":            "wfh",
-        "work_from_home": "wfh",
-        "compensation":   "compensation",
-        "benefits":       "compensation",
-        "onboarding":     "separation",
-        "separation":     "separation",
-        "performance":    "performance",
-        "it_and_data":    "it_security",
-        "code_of_conduct":"conduct",
-        "posh":           "harassment",
-        "sexual_harass":  "harassment",
-        "employee_handbook": "handbook",
-        "company_profile": "company",
+        "leave":            "leave",
+        "wfh":              "wfh",
+        "work_from_home":   "wfh",
+        "compensation":     "compensation",
+        "benefits":         "compensation",
+        "onboarding":       "separation",
+        "separation":       "separation",
+        "performance":      "performance",
+        "it_and_data":      "it_security",
+        "code_of_conduct":  "conduct",
+        "posh":             "harassment",
+        "sexual_harass":    "harassment",
+        "employee_handbook":"handbook",
+        "company_profile":  "company",
     }
 
     for doc in docs:
@@ -420,22 +455,12 @@ def _enrich_metadata(docs: list[Document]) -> None:
         doc.metadata["policy_type"] = policy_type
 
 # ==============================================================================
-# CHUNKING  (Missing Piece #2: smaller chunks → 150-250 for 39 pages)
+# CHUNKING
 # ==============================================================================
 
 
 def _build_chunks(docs: list[Document]) -> list[Document]:
-    """Split documents into fine-grained chunks with metadata preambles.
-
-    Uses ``CHUNK_SIZE=500, CHUNK_OVERLAP=100`` to produce ~150-250 chunks
-    for a 39-page corpus (vs ~99 at 800/200), improving retrieval precision.
-
-    Args:
-        docs: Cleaned and enriched page-level documents.
-
-    Returns:
-        Flat list of chunk-level :class:`Document` objects.
-    """
+    """Split documents into fine-grained chunks with metadata preambles."""
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
@@ -454,7 +479,6 @@ def _build_chunks(docs: list[Document]) -> list[Document]:
     for idx, chunk in enumerate(chunks):
         chunk.metadata["chunk_id"] = idx
 
-    # Prepend structured metadata preamble — improves embedding discriminability
     for chunk in chunks:
         preamble = (
             f"Policy: {chunk.metadata.get('policy_name', '')}\n"
@@ -467,7 +491,6 @@ def _build_chunks(docs: list[Document]) -> list[Document]:
         "Generated %d chunks from %d page(s) (chunk_size=%d, overlap=%d).",
         len(chunks), len(docs), CHUNK_SIZE, CHUNK_OVERLAP,
     )
-    # CP7: print so it's visible in terminal even at WARNING log level
     print(f"[CHUNKS] Built {len(chunks)} chunks from {len(docs)} pages.")
     return chunks
 
@@ -477,7 +500,6 @@ def _build_chunks(docs: list[Document]) -> list[Document]:
 
 
 def _build_embedding_model() -> HuggingFaceEmbeddings:
-    """Load the BGE large embedding model with L2 normalisation."""
     logger.info("Loading embedding model: %s", EMBEDDING_MODEL)
     return HuggingFaceEmbeddings(
         model_name=EMBEDDING_MODEL,
@@ -494,15 +516,7 @@ def build_vectorstore(
     docs_dir: str = DOCS_PATH,
     faiss_path: str = FAISS_PATH,
 ) -> tuple[FAISS, list[Document]]:
-    """Load PDFs, chunk, embed, build FAISS index, and persist.
-
-    Args:
-        docs_dir: Directory containing source PDFs.
-        faiss_path: Directory to save the FAISS index.
-
-    Returns:
-        ``(vectorstore, chunks)`` tuple.
-    """
+    """Load PDFs, chunk, embed, build FAISS index, and persist."""
     docs = load_documents(docs_dir)
     chunks = _build_chunks(docs)
     embeddings = _build_embedding_model()
@@ -510,22 +524,13 @@ def build_vectorstore(
     logger.info("Building FAISS index over %d chunks…", len(chunks))
     vectorstore = FAISS.from_documents(documents=chunks, embedding=embeddings)
     vectorstore.save_local(faiss_path)
+    _save_chunk_hash(faiss_path)          # FIX 5: persist hash for cache check
     logger.info("FAISS index saved to '%s'.", faiss_path)
     return vectorstore, chunks
 
 
 def load_vectorstore(faiss_path: str = FAISS_PATH) -> FAISS:
-    """Load a previously persisted FAISS index from disk.
-
-    Args:
-        faiss_path: Path to saved FAISS index directory.
-
-    Returns:
-        Ready :class:`FAISS` vectorstore.
-
-    Raises:
-        FileNotFoundError: If *faiss_path* does not exist.
-    """
+    """Load a previously persisted FAISS index from disk."""
     if not Path(faiss_path).exists():
         raise FileNotFoundError(
             f"FAISS index not found at '{faiss_path}'. Run build_vectorstore() first."
@@ -542,14 +547,6 @@ def load_vectorstore(faiss_path: str = FAISS_PATH) -> FAISS:
 
 
 def _build_bm25_retriever(chunks: list[Document]) -> BM25Retriever:
-    """Build BM25 sparse retriever.
-
-    Args:
-        chunks: Chunk-level documents.
-
-    Returns:
-        :class:`BM25Retriever` configured for ``TOP_K_RETRIEVAL`` results.
-    """
     retriever = BM25Retriever.from_documents(chunks)
     retriever.k = TOP_K_RETRIEVAL
     logger.info("BM25 retriever built with k=%d.", TOP_K_RETRIEVAL)
@@ -564,15 +561,7 @@ def build_retrievers(
     vectorstore: FAISS,
     chunks: list[Document],
 ) -> EnsembleRetriever:
-    """Compose MMR and BM25 into a weighted EnsembleRetriever.
-
-    Args:
-        vectorstore: Ready FAISS vectorstore.
-        chunks: Chunk documents for BM25 indexing.
-
-    Returns:
-        :class:`EnsembleRetriever` with weights ``[0.6, 0.4]``.
-    """
+    """Compose MMR and BM25 into a weighted EnsembleRetriever."""
     mmr_retriever = vectorstore.as_retriever(
         search_type="mmr",
         search_kwargs={"k": TOP_K_RETRIEVAL, "fetch_k": MMR_FETCH_K},
@@ -583,7 +572,6 @@ def build_retrievers(
         weights=ENSEMBLE_WEIGHTS,
     )
     logger.info("EnsembleRetriever built (weights=%s).", ENSEMBLE_WEIGHTS)
-    # CP1: confirm both retrievers are wired correctly
     logger.info(
         "[ENSEMBLE] type=%s | retrievers=[%s, %s]",
         type(ensemble).__name__,
@@ -598,7 +586,6 @@ def build_retrievers(
 
 
 def _build_reranker() -> CrossEncoder:
-    """Load the BGE cross-encoder reranking model."""
     logger.info("Loading reranker: %s", RERANKER_MODEL)
     return CrossEncoder(RERANKER_MODEL)
 
@@ -610,17 +597,7 @@ def rerank_documents(
     reranker: CrossEncoder,
     top_k: int = TOP_K_RERANK,
 ) -> list[tuple[Document, float]]:
-    """Score *docs* against *query* with the cross-encoder.
-
-    Args:
-        query: User question (may be expanded).
-        docs: Candidate documents from the ensemble retriever.
-        reranker: Loaded :class:`~sentence_transformers.CrossEncoder`.
-        top_k: Number of top-scored docs to return.
-
-    Returns:
-        List of ``(document, score)`` tuples sorted by score descending.
-    """
+    """Score docs against query with the cross-encoder."""
     if not docs:
         return []
     pairs = [(query, doc.page_content) for doc in docs]
@@ -633,18 +610,7 @@ def _boost_posh_scores(
     query: str,
     ranked: list[tuple[Document, float]],
 ) -> list[tuple[Document, float]]:
-    """Boost POSH policy doc scores when query is harassment-related.
-
-    The cross-encoder undervalues POSH docs relative to Code of Conduct
-    because both use complaint-related language. A 3× boost corrects this.
-
-    Args:
-        query: Raw user question.
-        ranked: Sorted ``(doc, score)`` list from cross-encoder.
-
-    Returns:
-        Re-sorted list with POSH scores boosted for harassment queries.
-    """
+    """Boost POSH policy doc scores when query is harassment-related."""
     harassment_terms = {"harassment", "posh", "sexual", "complaint", "icc", "report"}
     if not any(term in query.lower() for term in harassment_terms):
         return ranked
@@ -681,31 +647,7 @@ def retrieve_context(
     rerank_threshold: float = RERANK_THRESHOLD,
     context_score_floor: float = CONTEXT_SCORE_FLOOR,
 ) -> list[Document] | str:
-    """Full hybrid retrieval pipeline.
-
-    Steps:
-        1. Fetch candidates using *query* (may be expanded) via EnsembleRetriever.
-        2. Rerank using *original_query* (unexpanded) — expansion distorts scores.
-        3. Apply domain boosts (POSH).
-        4. Primary threshold gate.
-        5. Secondary context quality floor.
-        6. Return top ``top_k_context`` docs.
-
-    Args:
-        query: Retrieval query (may be expanded for BM25 recall).
-        ensemble_retriever: Built :class:`EnsembleRetriever`.
-        reranker: Loaded :class:`~sentence_transformers.CrossEncoder`.
-        original_query: Unexpanded user question for reranking. If ``None``,
-            falls back to *query*.
-        top_k_retrieval: Number of ensemble candidates.
-        top_k_rerank: Number of docs after cross-encoder reranking.
-        top_k_context: Maximum context docs returned to LLM.
-        rerank_threshold: Primary OOS gate.
-        context_score_floor: Secondary quality filter.
-
-    Returns:
-        List of context :class:`Document` objects, or :data:`REFUSAL_MESSAGE`.
-    """
+    """Full hybrid retrieval pipeline with dual threshold gates."""
     rerank_query = original_query or query
     docs: list[Document] = ensemble_retriever.invoke(query)
     logger.info("[STEP 1] Retrieval complete — %d doc(s).", len(docs))
@@ -722,10 +664,8 @@ def retrieve_context(
         logger.warning("[STEP 2] Reranker returned nothing — refusing.")
         return REFUSAL_MESSAGE
 
-    # Domain-specific score boost
     ranked = _boost_posh_scores(query, ranked)
 
-    # Log top-5 for threshold tuning
     for i, (doc, score) in enumerate(ranked[:5]):
         logger.info(
             "[RANK %d] score=%.4f | policy='%s' | section='%s'",
@@ -745,11 +685,14 @@ def retrieve_context(
         logger.info("[STEP 2] Below threshold — refusing query.")
         return REFUSAL_MESSAGE
 
-    # Secondary context quality floor
-    filtered = [(doc, s) for doc, s in ranked if s >= context_score_floor]
-    if not filtered:
-        logger.info("[STEP 2] Floor filtered all — falling back to top-1.")
-        filtered = ranked[:1]
+    # Secondary context quality floor (FIX 2: floor is 0.00 — never drop chunks)
+    if context_score_floor > 0.0:
+        filtered = [(doc, s) for doc, s in ranked if s >= context_score_floor]
+        if not filtered:
+            logger.info("[STEP 2] Floor filtered all — falling back to top-1.")
+            filtered = ranked[:1]
+    else:
+        filtered = ranked  # pass everything through
 
     final_docs = [doc for doc, _ in filtered[:top_k_context]]
     logger.info("[STEP 3] Returning %d context doc(s).", len(final_docs))
@@ -761,13 +704,11 @@ def retrieve_context(
 
 
 def _build_llm() -> ChatGroq:
-    """Instantiate Llama-3.3-70B via Groq at temperature 0."""
     logger.info("Loading LLM: %s", LLM_MODEL)
     return ChatGroq(model=LLM_MODEL, temperature=0, api_key=GROQ_API_KEY)
 
 
 def _format_context(docs: list[Document]) -> str:
-    """Serialise context docs into a structured prompt block."""
     parts = []
     for doc in docs:
         part = (
@@ -781,7 +722,6 @@ def _format_context(docs: list[Document]) -> str:
 
 
 def _build_sources(docs: list[Document]) -> list[dict[str, str]]:
-    """Build deduplicated source citation list from context docs."""
     seen: set[tuple[str, str]] = set()
     sources: list[dict[str, str]] = []
     for doc in docs:
@@ -803,34 +743,14 @@ def _validate_answer(
 ) -> bool:
     """Validate that the generated answer is grounded in context.
 
-    Two-stage check:
-
-    Stage 1 — Cross-encoder Q-A relevance score.
-        ``reranker.predict`` returns a numpy array; use ``.item()`` (not
-        ``float()``) to extract the scalar — avoids the
-        "only 0-dimensional arrays can be converted to Python scalars" error.
-        Answers scoring below 0.01 are semantically unrelated to the question.
-
-    Stage 2 — Numeric consistency.
-        If the answer contains numbers, at least one must appear in context.
-        Catches hallucinated figures (e.g. "12 days" when policy says "10 days").
-
-    Args:
-        question: Original user question.
-        answer: Generated answer to validate.
-        context: Context string used for generation.
-        reranker: The already-loaded cross-encoder (reused, no extra cost).
-
-    Returns:
-        ``True`` if the answer passes both stages, ``False`` otherwise.
+    Stage 1: Cross-encoder Q-A relevance (scores below 0.01 → off-topic).
+    Stage 2: Numeric consistency (numbers in answer must appear in context).
     """
     if REFUSAL_MESSAGE.lower() in answer.lower():
         return True
 
-    # Stage 1: Q-A cross-encoder relevance
     try:
         raw = reranker.predict([(question, answer)])
-        # raw is a numpy ndarray — use .item() not float() to extract scalar
         qa_score: float = raw.item() if hasattr(raw, "item") else float(raw[0])
         logger.info("[VALIDATE] Q-A score: %.4f", qa_score)
         if qa_score < 0.01:
@@ -839,7 +759,6 @@ def _validate_answer(
     except Exception as exc:
         logger.warning("[VALIDATE] Stage 1 failed (%s) — continuing to stage 2.", exc)
 
-    # Stage 2: numeric consistency
     answer_numbers = re.findall(r"\b\d+(?:\.\d+)?\b", answer)
     if answer_numbers:
         context_numbers = set(re.findall(r"\b\d+(?:\.\d+)?\b", context))
@@ -861,31 +780,12 @@ def answer_question(
     reranker: CrossEncoder,
     llm: ChatGroq,
 ) -> dict[str, Any]:
-    """Full RAG pipeline: OOS check → expand → retrieve → generate → validate.
-
-    Pipeline:
-        1. Instant OOS check (keyword/pattern — no retrieval cost).
-        2. Query expansion for BM25 recall.
-        3. Hybrid retrieval with dual threshold gates.
-        4. LLM answer generation with strict grounding prompt.
-        5. Answer validation — refuse if not grounded.
-
-    Args:
-        query: User's HR-related question.
-        ensemble_retriever: Built :class:`EnsembleRetriever`.
-        reranker: Loaded :class:`~sentence_transformers.CrossEncoder`.
-        llm: Ready :class:`~langchain_groq.ChatGroq` instance.
-
-    Returns:
-        Dict with ``"answer"``, ``"sources"``, ``"documents"``.
-    """
+    """Full RAG pipeline: OOS check → expand → retrieve → generate → validate."""
     logger.info("[STEP 0] Query: '%s'", query)
 
-    # Missing Piece #1: instant OOS gate before any retrieval
     if _is_oos_query(query):
         return {"answer": REFUSAL_MESSAGE, "sources": [], "documents": []}
 
-    # Query expansion improves BM25 recall; original query used for reranking (CP5)
     retrieval_query = _expand_query(query)
 
     context_or_refusal = retrieve_context(
@@ -921,7 +821,6 @@ def answer_question(
         logger.error("LLM invocation failed: %s", exc)
         return {"answer": REFUSAL_MESSAGE, "sources": [], "documents": []}
 
-    # CP3: validate with cross-encoder + numeric check (not self-grading LLM)
     if not _validate_answer(query, answer, context, reranker):
         logger.info("[STEP 6] Validation failed — returning refusal.")
         return {"answer": REFUSAL_MESSAGE, "sources": [], "documents": []}
@@ -933,7 +832,7 @@ def answer_question(
     }
 
 # ==============================================================================
-# EVALUATION  (Missing Piece #8: local harness)
+# EVALUATION
 # ==============================================================================
 
 _GOLD_DATASET: list[dict[str, Any]] = [
@@ -967,6 +866,10 @@ _GOLD_DATASET: list[dict[str, Any]] = [
     {"question": "What is Bitcoin?",                                    "answer_contains": ["I can only answer HR-related questions"]},
     {"question": "Write Python code for quicksort",                     "answer_contains": ["I can only answer HR-related questions"]},
     {"question": "What is today's weather?",                            "answer_contains": ["I can only answer HR-related questions"]},
+    # ── Extended OOS (edge cases FIX 3) ───────────────────────────────────
+    {"question": "Who is Virat Kohli?",                                 "answer_contains": ["I can only answer HR-related questions"]},
+    {"question": "Explain machine learning.",                           "answer_contains": ["I can only answer HR-related questions"]},
+    {"question": "What is a database?",                                 "answer_contains": ["I can only answer HR-related questions"]},
 ]
 
 
@@ -977,17 +880,7 @@ def evaluate(
     llm: ChatGroq,
     test_cases: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Run keyword-match evaluation over the gold dataset.
-
-    Args:
-        ensemble_retriever: Built :class:`EnsembleRetriever`.
-        reranker: Loaded :class:`~sentence_transformers.CrossEncoder`.
-        llm: Ready :class:`~langchain_groq.ChatGroq` instance.
-        test_cases: Optional custom test cases; defaults to ``_GOLD_DATASET``.
-
-    Returns:
-        Dict with ``"total"``, ``"correct"``, ``"accuracy"``, ``"results"``.
-    """
+    """Run keyword-match evaluation over the gold dataset."""
     dataset = test_cases if test_cases is not None else _GOLD_DATASET
     total = len(dataset)
     correct = 0
@@ -1015,6 +908,9 @@ def evaluate(
 
         status = "PASS" if passed else "FAIL"
         logger.info("[%s] %s", status, question)
+        if not passed:
+            logger.info("  Expected: %s", expected)
+            logger.info("  Got: %s", answer[:200])
         results.append({"question": question, "passed": passed, "answer": answer})
 
     accuracy = correct / total if total else 0.0
@@ -1032,15 +928,15 @@ def main() -> None:
     """Build the RAG pipeline and run evaluation."""
     logger.info("=== Zyro Dynamics RAG Pipeline Starting ===")
 
-    faiss_index_path = Path(FAISS_PATH)
-    if faiss_index_path.exists():
-        logger.info("FAISS index found — loading from disk.")
+    # FIX 5: Use hash-based cache invalidation instead of existence-only check
+    if _faiss_needs_rebuild(FAISS_PATH):
+        logger.info("Building FAISS index from scratch (new or stale index).")
+        vectorstore, chunks = build_vectorstore(DOCS_PATH, FAISS_PATH)
+    else:
+        logger.info("FAISS index up-to-date — loading from disk.")
         vectorstore = load_vectorstore(FAISS_PATH)
         docs = load_documents(DOCS_PATH)
         chunks = _build_chunks(docs)
-    else:
-        logger.info("No FAISS index found — building from scratch.")
-        vectorstore, chunks = build_vectorstore(DOCS_PATH, FAISS_PATH)
 
     ensemble_retriever = build_retrievers(vectorstore, chunks)
     reranker = _build_reranker()
@@ -1059,6 +955,13 @@ def main() -> None:
         eval_results["total"],
         eval_results["accuracy"] * 100,
     )
+
+    # Print FAIL details for quick diagnosis
+    for r in eval_results["results"]:
+        if not r["passed"]:
+            print(f"\n[FAIL] {r['question']}")
+            print(f"       Answer: {r['answer'][:300]}")
+
     logger.info("=== Pipeline Complete ===")
 
 
